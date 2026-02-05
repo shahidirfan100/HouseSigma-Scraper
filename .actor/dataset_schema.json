@@ -1,0 +1,48 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "address",
+          "price",
+          "bedrooms",
+          "bathrooms",
+          "propertyType",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "address": {
+            "label": "Address",
+            "format": "text"
+          },
+          "price": {
+            "label": "Price",
+            "format": "text"
+          },
+          "bedrooms": {
+            "label": "Bedrooms",
+            "format": "text"
+          },
+          "bathrooms": {
+            "label": "Bathrooms",
+            "format": "text"
+          },
+          "propertyType": {
+            "label": "Property Type",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}
