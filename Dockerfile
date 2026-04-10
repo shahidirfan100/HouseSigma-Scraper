@@ -1,6 +1,6 @@
 # Specify the base Docker image with Playwright + Chrome
 # Check available versions: https://hub.docker.com/r/apify/actor-node-playwright-chrome
-FROM apify/actor-node-playwright-chrome:22-1.56.1
+FROM apify/actor-node-playwright-chrome:24-1.59.1
 
 # Check preinstalled packages
 RUN npm ls crawlee apify puppeteer playwright

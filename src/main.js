@@ -45,6 +45,73 @@ const toPositiveInt = (value, fallback) => {
     return Math.max(1, Math.floor(parsed));
 };
 
+const stableStringify = (value) => {
+    if (value === null || value === undefined) return 'null';
+    if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+    if (typeof value === 'object') {
+        const entries = Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
+        return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+};
+
+const removeEmptyDeep = (value) => {
+    if (value === null || value === undefined) return undefined;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+    if (typeof value === 'string') return value.trim() === '' ? undefined : value;
+    if (Array.isArray(value)) {
+        const deduped = [];
+        const seen = new Set();
+        for (const item of value) {
+            const cleaned = removeEmptyDeep(item);
+            if (cleaned === undefined) continue;
+            const hash = stableStringify(cleaned);
+            if (seen.has(hash)) continue;
+            seen.add(hash);
+            deduped.push(cleaned);
+        }
+        return deduped.length ? deduped : undefined;
+    }
+    if (typeof value === 'object') {
+        const cleanedObject = {};
+        for (const [key, nested] of Object.entries(value)) {
+            const cleaned = removeEmptyDeep(nested);
+            if (cleaned !== undefined) {
+                cleanedObject[key] = cleaned;
+            }
+        }
+        return Object.keys(cleanedObject).length ? cleanedObject : undefined;
+    }
+    return value;
+};
+
+const normalizeListingRecord = (record) => {
+    const cleaned = removeEmptyDeep(record);
+    return cleaned && typeof cleaned === 'object' ? cleaned : null;
+};
+
+const createListingKey = (listing) => {
+    const candidates = [
+        listing?.listingId,
+        listing?.mlsNumber,
+        listing?.url,
+        listing?.raw?.id_listing,
+        listing?.raw?.ml_num,
+    ];
+    const best = candidates.find((v) => typeof v === 'string' || typeof v === 'number');
+    if (best !== undefined && best !== null && String(best).trim() !== '') {
+        return String(best).trim();
+    }
+    const fallback = {
+        address: listing?.address || null,
+        price: listing?.price || null,
+        propertyType: listing?.propertyType || null,
+        source: listing?._source || null,
+        listingType: listing?._listing_type || null,
+    };
+    return stableStringify(fallback);
+};
+
 const deriveProvinceFromUrl = (url) => {
     try {
         const { pathname } = new URL(url);
@@ -162,7 +229,7 @@ const mapListing = (listing, { province, listingSlug }) => {
     const bedrooms = listing?.bedroom_string ?? listing?.bedroom ?? null;
     const bathrooms = listing?.washroom ?? null;
     const price = listing?.price ?? listing?.price_sold ?? listing?.price_abbr ?? null;
-    return {
+    return normalizeListingRecord({
         url: buildListingUrl(listing, province),
         address: listing?.address || listing?.address_navigation || null,
         price,
@@ -179,7 +246,25 @@ const mapListing = (listing, { province, listingSlug }) => {
         raw: listing,
         _source: 'housesigma.com',
         _listing_type: listingSlug || null,
-    };
+    });
+};
+
+const extractGalleryImages = (detail) => {
+    const primary = detail?.picture?.photo_list;
+    const fallback = detail?.picture?.preview_photo_thumb_list;
+    const candidates = Array.isArray(primary) && primary.length ? primary : fallback;
+    if (!Array.isArray(candidates)) return [];
+
+    const seen = new Set();
+    const gallery = [];
+    for (const url of candidates) {
+        if (typeof url !== 'string') continue;
+        const trimmed = url.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        gallery.push(trimmed);
+    }
+    return gallery;
 };
 
 const createEncryptionContext = async (secret) => ({
@@ -257,6 +342,7 @@ async function main() {
         }));
 
         let saved = 0;
+        const globalSeenListingKeys = new Set();
 
         const runApiFirst = async () => {
             const api = createApiClient(proxyConfiguration);
@@ -266,7 +352,34 @@ async function main() {
             const { type, matched } = resolveRecommendType(config, listingSlug);
             const province = deriveProvinceFromUrl(initial[0]) || 'ON';
             const ctx = await createEncryptionContext(secret);
-            const seen = new Set();
+            const galleryCache = new Map();
+
+            const fetchGalleryForListing = async (idAddress) => {
+                if (!idAddress || typeof idAddress !== 'string') return [];
+                if (galleryCache.has(idAddress)) return galleryCache.get(idAddress);
+
+                try {
+                    const detail = await callEncryptedWithContext({
+                        api,
+                        token,
+                        path: '/listing/info/detail_v2',
+                        payload: {
+                            lang: 'en_US',
+                            province,
+                            id_address: idAddress,
+                            event_source: '',
+                        },
+                        ctx,
+                    });
+                    const gallery = extractGalleryImages(detail);
+                    galleryCache.set(idAddress, gallery);
+                    return gallery;
+                } catch (error) {
+                    log.debug(`Gallery fetch failed for ${idAddress}: ${error?.message || 'Unknown error'}`);
+                    galleryCache.set(idAddress, []);
+                    return [];
+                }
+            };
 
             if (!matched && startUrl) {
                 log.warning(`Start URL slug "${listingSlug}" not recognized by config. Switching to secondary retrieval.`);
@@ -297,19 +410,35 @@ async function main() {
 
                 const remaining = RESULTS_WANTED - saved;
                 const batch = [];
+                let galleryHits = 0;
 
                 for (const item of list) {
-                    const id = item?.id_listing || item?.ml_num || JSON.stringify(item).slice(0, 50);
-                    if (seen.has(id)) continue;
-                    seen.add(id);
-                    batch.push(mapListing(item, { province, listingSlug }));
+                    let mapped = mapListing(item, { province, listingSlug });
+                    if (!mapped) continue;
+
+                    const galleryImages = await fetchGalleryForListing(item?.id_address);
+                    if (galleryImages.length) {
+                        galleryHits++;
+                        mapped = normalizeListingRecord({
+                            ...mapped,
+                            photoUrl: mapped.photoUrl || galleryImages[0],
+                            galleryImages,
+                            galleryImageCount: galleryImages.length,
+                        });
+                        if (!mapped) continue;
+                    }
+
+                    const dedupeKey = createListingKey(mapped);
+                    if (globalSeenListingKeys.has(dedupeKey)) continue;
+                    globalSeenListingKeys.add(dedupeKey);
+                    batch.push(mapped);
                     if (batch.length >= remaining) break;
                 }
 
                 if (batch.length) {
                     await Dataset.pushData(batch);
                     saved += batch.length;
-                    log.info(`Page ${page} processed: saved ${batch.length}, total ${saved}`);
+                    log.info(`Page ${page} processed: saved ${batch.length}, withGallery ${galleryHits}, total ${saved}`);
                 }
             }
 
@@ -480,12 +609,21 @@ async function main() {
                 crawlerLog.info(`Page ${pageNo} processed. Candidates: ${listings.length}`);
 
                 const remaining = RESULTS_WANTED - saved;
-                const toPush = listings.slice(0, Math.max(0, remaining));
-                if (toPush.length) {
-                    await Dataset.pushData(toPush.map(item => ({
+                const toPush = [];
+                for (const item of listings) {
+                    if (toPush.length >= remaining) break;
+                    const normalized = normalizeListingRecord({
                         ...item,
-                        _source: 'housesigma.com'
-                    })));
+                        _source: 'housesigma.com',
+                    });
+                    if (!normalized) continue;
+                    const dedupeKey = createListingKey(normalized);
+                    if (globalSeenListingKeys.has(dedupeKey)) continue;
+                    globalSeenListingKeys.add(dedupeKey);
+                    toPush.push(normalized);
+                }
+                if (toPush.length) {
+                    await Dataset.pushData(toPush);
                     saved += toPush.length;
                 }
 
