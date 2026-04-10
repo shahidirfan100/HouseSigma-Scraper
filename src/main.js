@@ -7,6 +7,8 @@ import { inflateSync, inflateRawSync, gunzipSync } from 'zlib';
 import { load as cheerioLoad } from 'cheerio';
 
 const API_BASE = 'https://housesigma.com/bkv2/api';
+const GALLERY_FETCH_CONCURRENCY = 6;
+const GALLERY_FETCH_MAX_ATTEMPTS = 2;
 const PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDQlOcjEbqprurl2xjoEP0QdjGI
 rZhLVn5vzwCorG4+2AtSi4AAHjghSXM//ljqE5rA13gfTc58JvM6I75Dmqr5r5Vv
@@ -19,6 +21,7 @@ const textEncoder = new TextEncoder();
 const base64ToBytes = (b64) => Uint8Array.from(Buffer.from(b64 || '', 'base64'));
 const bytesToBase64 = (buf) => Buffer.from(buf).toString('base64');
 const nowTs = () => Math.floor(Date.now() / 1000).toString();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const tryInflate = (buf) => {
     try {
@@ -43,6 +46,24 @@ const toPositiveInt = (value, fallback) => {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.max(1, Math.floor(parsed));
+};
+
+const asyncMapLimit = async (items, limit, mapper) => {
+    if (!Array.isArray(items) || items.length === 0) return [];
+    const maxWorkers = Math.max(1, Math.min(limit, items.length));
+    const results = new Array(items.length);
+    let cursor = 0;
+
+    const workers = Array.from({ length: maxWorkers }, async () => {
+        while (true) {
+            const index = cursor++;
+            if (index >= items.length) break;
+            results[index] = await mapper(items[index], index);
+        }
+    });
+
+    await Promise.all(workers);
+    return results;
 };
 
 const stableStringify = (value) => {
@@ -161,7 +182,10 @@ const rsaEncrypt = async (bytes, pubKey) => {
 };
 
 const createApiClient = (proxyConfiguration) => {
-    const getProxyUrl = () => proxyConfiguration?.newUrl?.();
+    const getProxyUrl = async () => {
+        if (!proxyConfiguration?.newUrl) return undefined;
+        return proxyConfiguration.newUrl();
+    };
     const baseHeaders = {
         'HS-Client-Type': 'desktop_v7',
         'HS-Client-Version': '7.21.152',
@@ -169,7 +193,7 @@ const createApiClient = (proxyConfiguration) => {
     };
 
     const post = async (path, { json, headers } = {}) => {
-        const proxyUrl = getProxyUrl();
+        const proxyUrl = await getProxyUrl();
         return gotScraping.post(`${API_BASE}${path}`, {
             json: json ?? {},
             responseType: 'json',
@@ -333,13 +357,10 @@ async function main() {
 
         const initial = startUrl ? [startUrl] : ['https://housesigma.com/on/listings/newly-listed/'];
 
-        // Create proxy configuration (residential recommended for protected sites)
-        const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig || (Actor.isAtHome() ? {
-            useApifyProxy: true,
-            apifyProxyGroups: ['RESIDENTIAL'],
-        } : {
-            useApifyProxy: false,
-        }));
+        // Use direct API requests by default for speed; proxy remains fully user-configurable via input.
+        const proxyConfiguration = proxyConfig
+            ? await Actor.createProxyConfiguration(proxyConfig)
+            : undefined;
 
         let saved = 0;
         const globalSeenListingKeys = new Set();
@@ -358,26 +379,31 @@ async function main() {
                 if (!idAddress || typeof idAddress !== 'string') return [];
                 if (galleryCache.has(idAddress)) return galleryCache.get(idAddress);
 
-                try {
-                    const detail = await callEncryptedWithContext({
-                        api,
-                        token,
-                        path: '/listing/info/detail_v2',
-                        payload: {
-                            lang: 'en_US',
-                            province,
-                            id_address: idAddress,
-                            event_source: '',
-                        },
-                        ctx,
-                    });
-                    const gallery = extractGalleryImages(detail);
-                    galleryCache.set(idAddress, gallery);
-                    return gallery;
-                } catch (error) {
-                    log.debug(`Gallery fetch failed for ${idAddress}: ${error?.message || 'Unknown error'}`);
-                    galleryCache.set(idAddress, []);
-                    return [];
+                for (let attempt = 1; attempt <= GALLERY_FETCH_MAX_ATTEMPTS; attempt++) {
+                    try {
+                        const detail = await callEncryptedWithContext({
+                            api,
+                            token,
+                            path: '/listing/info/detail_v2',
+                            payload: {
+                                lang: 'en_US',
+                                province,
+                                id_address: idAddress,
+                                event_source: '',
+                            },
+                            ctx,
+                        });
+                        const gallery = extractGalleryImages(detail);
+                        galleryCache.set(idAddress, gallery);
+                        return gallery;
+                    } catch (error) {
+                        if (attempt >= GALLERY_FETCH_MAX_ATTEMPTS) {
+                            log.debug(`Gallery fetch failed for ${idAddress}: ${error?.message || 'Unknown error'}`);
+                            galleryCache.set(idAddress, []);
+                            return [];
+                        }
+                        await sleep(attempt * 250);
+                    }
                 }
             };
 
@@ -389,10 +415,12 @@ async function main() {
             log.info(`Listing type resolved: slug=${listingSlug} type=${type} province=${province}`);
 
             for (let page = 1; page <= MAX_PAGES && saved < RESULTS_WANTED; page++) {
+                const remaining = RESULTS_WANTED - saved;
+                const pageSize = Math.min(50, Math.max(10, remaining));
                 const payload = {
                     type,
                     page,
-                    page_size: 10,
+                    page_size: pageSize,
                     province,
                     lang: 'en',
                 };
@@ -408,36 +436,34 @@ async function main() {
                 const list = Array.isArray(data?.list) ? data.list : [];
                 if (!list.length) break;
 
-                const remaining = RESULTS_WANTED - saved;
-                const batch = [];
-                let galleryHits = 0;
+                const candidates = [];
 
                 for (const item of list) {
+                    if (candidates.length >= remaining) break;
                     let mapped = mapListing(item, { province, listingSlug });
                     if (!mapped) continue;
-
-                    const galleryImages = await fetchGalleryForListing(item?.id_address);
-                    if (galleryImages.length) {
-                        galleryHits++;
-                        mapped = normalizeListingRecord({
-                            ...mapped,
-                            photoUrl: mapped.photoUrl || galleryImages[0],
-                            galleryImages,
-                            galleryImageCount: galleryImages.length,
-                        });
-                        if (!mapped) continue;
-                    }
-
                     const dedupeKey = createListingKey(mapped);
                     if (globalSeenListingKeys.has(dedupeKey)) continue;
                     globalSeenListingKeys.add(dedupeKey);
-                    batch.push(mapped);
-                    if (batch.length >= remaining) break;
+                    candidates.push({ item, mapped });
                 }
 
+                const enriched = await asyncMapLimit(candidates, GALLERY_FETCH_CONCURRENCY, async ({ item, mapped }) => {
+                    const galleryImages = await fetchGalleryForListing(item?.id_address);
+                    if (!galleryImages.length) return mapped;
+                    return {
+                        ...mapped,
+                        photoUrl: mapped.photoUrl || galleryImages[0],
+                        galleryImages,
+                        galleryImageCount: galleryImages.length,
+                    };
+                });
+
+                const batch = enriched.filter(Boolean);
                 if (batch.length) {
                     await Dataset.pushData(batch);
                     saved += batch.length;
+                    const galleryHits = batch.filter((record) => Array.isArray(record.galleryImages) && record.galleryImages.length > 0).length;
                     log.info(`Page ${page} processed: saved ${batch.length}, withGallery ${galleryHits}, total ${saved}`);
                 }
             }
