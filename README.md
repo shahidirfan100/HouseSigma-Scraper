@@ -32,6 +32,7 @@ Evaluate comparable properties for valuation and acquisition research. Create be
 | `startUrl` | String | No | `https://housesigma.com/on/listings/newly-listed/` | Listings page to start collecting from |
 | `results_wanted` | Integer | No | `20` | Maximum number of listings to collect |
 | `max_pages` | Integer | No | `20` | Maximum number of pages to visit |
+| `includeGallery` | Boolean | No | `false` | Fetch full gallery images for each listing (slower when enabled) |
 | `proxyConfiguration` | Object | No | `{ "useApifyProxy": false }` | Proxy settings for more reliable collection |
 
 ---
@@ -48,6 +49,8 @@ Each item in the dataset contains:
 | `bathrooms` | String | Number of bathrooms when available |
 | `propertyType` | String | Property type category |
 | `url` | String | Listing URL |
+| `galleryImages` | Array | Full listing gallery image URLs (when `includeGallery` is enabled) |
+| `galleryImageCount` | Integer | Number of gallery images collected |
 
 ---
 

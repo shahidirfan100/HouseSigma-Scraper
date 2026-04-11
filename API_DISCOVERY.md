@@ -7,6 +7,14 @@
 - Fields currently exposed by actor output: `url`, `address`, `price`, `bedrooms`, `bathrooms`, `propertyType`, `mlsNumber`, `listingId`, `listStatus`, `photoUrl`, `municipality`, `province`, `priceInt`, `raw`, `_source`, `_listing_type`
 - Field count: API response has 30+ useful fields per listing (actor exposes 16 top-level fields and keeps full cleaned `raw` object)
 
+## Gallery API (Optional Enrichment)
+- Endpoint: `https://housesigma.com/bkv2/api/listing/info/photos`
+- Method: `POST`
+- Auth: Bearer token from `POST /bkv2/api/init/accesstoken/new`
+- Payload: `{ "id_listing": "<listing-id>" }`
+- Why selected: returns `picture.photo_list` directly and is significantly lighter than `/listing/info/detail_v2`.
+- Usage in actor: only when `includeGallery` is enabled, to keep default runs fully fast.
+
 ## URLScan Evidence
 - URLScan search used: `https://urlscan.io/api/v1/search/?q=domain:housesigma.com`
 - Scan reviewed: `019d52db-1b27-74db-97ff-002afc76cad4` (April 3, 2026)
@@ -15,6 +23,7 @@
   - `POST /bkv2/api/init/accesstoken/new` (token + secret bootstrap)
   - `POST /bkv2/api/init/config/homepage` (recommendation type metadata)
   - `POST /bkv2/api/search/homepage/recommendlist_v2` (primary listing data)
+  - `POST /bkv2/api/listing/info/photos` (listing gallery photos by `id_listing`)
 
 ## Candidate Scoring
 - `recommendlist_v2`: JSON direct (+30), >15 fields (+25), no account login needed (+20), pagination (+15), extends existing fields (+10) = **100**

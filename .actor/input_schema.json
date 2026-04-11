@@ -30,15 +30,20 @@
       "default": 20,
       "prefill": 20
     },
+    "includeGallery": {
+      "title": "Include gallery images",
+      "type": "boolean",
+      "description": "When enabled, fetches full gallery images for each listing. Disable for the fastest runs.",
+      "default": false,
+      "prefill": false,
+      "editor": "checkbox"
+    },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
       "description": "Use Apify Proxy for scraping.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": false
-      },
-      "prefill": {
         "useApifyProxy": false
       }
     }

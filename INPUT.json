@@ -2,7 +2,5 @@
   "startUrl": "https://housesigma.com/on/listings/newly-listed/",
   "results_wanted": 20,
   "max_pages": 20,
-  "proxyConfiguration": {
-    "useApifyProxy": false
-  }
+  "includeGallery": false
 }

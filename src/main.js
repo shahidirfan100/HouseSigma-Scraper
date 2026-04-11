@@ -7,8 +7,7 @@ import { inflateSync, inflateRawSync, gunzipSync } from 'zlib';
 import { load as cheerioLoad } from 'cheerio';
 
 const API_BASE = 'https://housesigma.com/bkv2/api';
-const GALLERY_FETCH_CONCURRENCY = 6;
-const GALLERY_FETCH_MAX_ATTEMPTS = 2;
+const GALLERY_FETCH_CONCURRENCY = 10;
 const PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDQlOcjEbqprurl2xjoEP0QdjGI
 rZhLVn5vzwCorG4+2AtSi4AAHjghSXM//ljqE5rA13gfTc58JvM6I75Dmqr5r5Vv
@@ -21,7 +20,6 @@ const textEncoder = new TextEncoder();
 const base64ToBytes = (b64) => Uint8Array.from(Buffer.from(b64 || '', 'base64'));
 const bytesToBase64 = (buf) => Buffer.from(buf).toString('base64');
 const nowTs = () => Math.floor(Date.now() / 1000).toString();
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const tryInflate = (buf) => {
     try {
@@ -46,6 +44,17 @@ const toPositiveInt = (value, fallback) => {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.max(1, Math.floor(parsed));
+};
+
+const toBoolean = (value, fallback = false) => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+        if (['false', '0', 'no', 'off', ''].includes(normalized)) return false;
+    }
+    return fallback;
 };
 
 const asyncMapLimit = async (items, limit, mapper) => {
@@ -335,11 +344,13 @@ async function main() {
             results_wanted: resultsWantedRaw = 20,
             max_pages: maxPagesRaw = 20,
             startUrl,
+            includeGallery: includeGalleryRaw = false,
             proxyConfiguration: proxyConfig,
         } = input;
 
         const RESULTS_WANTED = toPositiveInt(resultsWantedRaw, Number.MAX_SAFE_INTEGER);
         const MAX_PAGES = toPositiveInt(maxPagesRaw, 20);
+        const INCLUDE_GALLERY = toBoolean(includeGalleryRaw, false);
 
         /**
          * Converts a relative URL to an absolute URL.
@@ -375,35 +386,28 @@ async function main() {
             const ctx = await createEncryptionContext(secret);
             const galleryCache = new Map();
 
-            const fetchGalleryForListing = async (idAddress) => {
-                if (!idAddress || typeof idAddress !== 'string') return [];
-                if (galleryCache.has(idAddress)) return galleryCache.get(idAddress);
+            const fetchGalleryForListing = async (listingId) => {
+                if (!listingId || typeof listingId !== 'string') return [];
+                if (galleryCache.has(listingId)) return galleryCache.get(listingId);
 
-                for (let attempt = 1; attempt <= GALLERY_FETCH_MAX_ATTEMPTS; attempt++) {
-                    try {
-                        const detail = await callEncryptedWithContext({
-                            api,
-                            token,
-                            path: '/listing/info/detail_v2',
-                            payload: {
-                                lang: 'en_US',
-                                province,
-                                id_address: idAddress,
-                                event_source: '',
-                            },
-                            ctx,
-                        });
-                        const gallery = extractGalleryImages(detail);
-                        galleryCache.set(idAddress, gallery);
-                        return gallery;
-                    } catch (error) {
-                        if (attempt >= GALLERY_FETCH_MAX_ATTEMPTS) {
-                            log.debug(`Gallery fetch failed for ${idAddress}: ${error?.message || 'Unknown error'}`);
-                            galleryCache.set(idAddress, []);
-                            return [];
-                        }
-                        await sleep(attempt * 250);
+                try {
+                    const photos = await api.post('/listing/info/photos', {
+                        json: { id_listing: listingId },
+                        headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (!photos.body?.status) {
+                        log.debug(`Gallery fetch failed for ${listingId}: ${photos.body?.error?.message || 'Unknown error'}`);
+                        galleryCache.set(listingId, []);
+                        return [];
                     }
+
+                    const gallery = extractGalleryImages(photos.body?.data);
+                    galleryCache.set(listingId, gallery);
+                    return gallery;
+                } catch (error) {
+                    log.debug(`Gallery fetch failed for ${listingId}: ${error?.message || 'Unknown error'}`);
+                    galleryCache.set(listingId, []);
+                    return [];
                 }
             };
 
@@ -412,7 +416,7 @@ async function main() {
                 return saved;
             }
 
-            log.info(`Listing type resolved: slug=${listingSlug} type=${type} province=${province}`);
+            log.info(`Listing type resolved: slug=${listingSlug} type=${type} province=${province} includeGallery=${INCLUDE_GALLERY}`);
 
             for (let page = 1; page <= MAX_PAGES && saved < RESULTS_WANTED; page++) {
                 const remaining = RESULTS_WANTED - saved;
@@ -448,18 +452,21 @@ async function main() {
                     candidates.push({ item, mapped });
                 }
 
-                const enriched = await asyncMapLimit(candidates, GALLERY_FETCH_CONCURRENCY, async ({ item, mapped }) => {
-                    const galleryImages = await fetchGalleryForListing(item?.id_address);
-                    if (!galleryImages.length) return mapped;
-                    return {
-                        ...mapped,
-                        photoUrl: mapped.photoUrl || galleryImages[0],
-                        galleryImages,
-                        galleryImageCount: galleryImages.length,
-                    };
-                });
+                let batch = candidates.map(({ mapped }) => mapped).filter(Boolean);
+                if (INCLUDE_GALLERY && batch.length) {
+                    const enriched = await asyncMapLimit(candidates, GALLERY_FETCH_CONCURRENCY, async ({ item, mapped }) => {
+                        const galleryImages = await fetchGalleryForListing(item?.id_listing);
+                        if (!galleryImages.length) return mapped;
+                        return {
+                            ...mapped,
+                            photoUrl: mapped.photoUrl || galleryImages[0],
+                            galleryImages,
+                            galleryImageCount: galleryImages.length,
+                        };
+                    });
+                    batch = enriched.filter(Boolean);
+                }
 
-                const batch = enriched.filter(Boolean);
                 if (batch.length) {
                     await Dataset.pushData(batch);
                     saved += batch.length;
